@@ -1,0 +1,357 @@
+#include "cache.h"
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <algorithm>
+#include <functional>
+#include <cstdint>
+#include <cmath>
+#include <limits>
+#include <iostream>
+#include <queue>
+
+extern uint64_t pf_useful;  // total useful prefetches
+extern uint64_t pf_useless; // total useless prefetches
+
+// ======================== Hash Function ============================
+
+//Rotate PC clockwise and Addr Anticlockwise
+static inline uint32_t H_simple(uint32_t x) { return (x << 16) | (x >> 16); }
+static inline uint32_t Hinv_simple(uint32_t x) { return (x >> 16) | (x << 16); }
+
+uint32_t hash_pc_addr(uint64_t pc, uint64_t addr) {  
+    uint32_t pc32 = static_cast<uint32_t>(pc ^ (pc >> 32));
+    uint32_t addr32 = static_cast<uint32_t>(addr ^ (addr >> 32));
+    return H_simple(pc32) ^ Hinv_simple(addr32) ^ addr32;
+}
+
+template<typename T>
+static inline T clamp_t(T v, T lo, T hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// ==================== Weighted-score CappedMap ========================
+template <typename K, typename V, size_t MaxSize, typename ConfidenceGetter = std::function<uint8_t(const V&)>>
+class CappedMap {
+    struct Item { V value; uint8_t seq; };
+    std::unordered_map<K, Item> index;
+    uint8_t seq_counter;
+    ConfidenceGetter conf_getter;
+    static constexpr double CONF_WEIGHT = 10.0;
+    static constexpr double AGE_WEIGHT  = 1.0;
+    static constexpr uint8_t MAX_CONF   = 3;
+public:
+    
+   CappedMap(ConfidenceGetter getter = ConfidenceGetter())
+        : seq_counter(1), conf_getter(getter)
+    {
+        if (!conf_getter) conf_getter = [](const V&) -> uint8_t { return 0; };
+        index.reserve(MaxSize * 2);
+    }
+
+    void put(const K& key, const V& value) {
+        auto it = index.find(key);
+        if (it != index.end()) {
+            it->second.value = value;
+            it->second.seq = seq_counter++;
+            return;
+        }
+
+        if (index.size() < MaxSize) {
+            index.emplace(key, Item{value, seq_counter++});
+            return;
+        }
+        K victim_key{};
+        double max_score = -1.0;
+        uint64_t now_seq = seq_counter;
+        for (auto &p : index) {
+            uint8_t conf = conf_getter(p.second.value);
+            uint64_t age = now_seq - p.second.seq;
+            double score = (double)(MAX_CONF - conf) * CONF_WEIGHT + (double)age * AGE_WEIGHT;
+
+            if (score > max_score) {
+                max_score = score;
+                victim_key = p.first;
+            }
+        }
+        index.erase(victim_key);
+        index.emplace(key, Item{value, seq_counter++});
+    }
+
+    bool get(const K& key, V &value) const {
+        auto it = index.find(key);
+        if (it == index.end()) return false;
+        value = it->second.value;
+        return true;
+    }
+
+    V* get_ptr(const K& key) {
+        auto it = index.find(key);
+        if (it == index.end()) return nullptr;
+        return &it->second.value;
+    }
+
+    bool contains(const K& key) const {
+        return index.find(key) != index.end();
+    }
+};
+
+// =============== FIFO-based CappedMap (for dupe table only) ==================
+template <typename K, typename V, size_t MaxSize>
+class FifoCappedMap {
+    std::unordered_map<K, V> index;
+    std::queue<K> fifo;
+public:
+    FifoCappedMap() { index.reserve(MaxSize * 2); }
+
+    void put(const K& key, const V& value) {
+
+        auto it = index.find(key);
+        if (it != index.end()) {
+            it->second = value;
+            return;
+        }
+
+        if (index.size() >= MaxSize) {
+            // Evict oldest key
+            K victim = fifo.front();
+            fifo.pop();
+            index.erase(victim);
+        }
+
+        fifo.push(key);
+        index.emplace(key, value);
+    }
+
+    bool contains(const K& key) const {
+        return index.find(key) != index.end();
+    }
+
+    V* get_ptr(const K& key) {
+        auto it = index.find(key);
+        if (it == index.end()) return nullptr;
+        return &it->second;
+    }
+};
+
+// ====================== Stride Table =========================
+struct StrideTableData {
+    int16_t stride;
+    uint8_t frequency : 6;
+    uint8_t confidence : 2;
+    bool valid : 1;
+    uint16_t useful_count;
+    uint16_t useless_count;
+};
+
+struct Entry {
+    uint32_t key;
+    StrideTableData data;
+};
+
+class StrideTable {
+public:
+    StrideTable(int sets, int ways) : num_sets(sets), num_ways(ways) {
+        entries.resize(num_sets, std::vector<Entry>(num_ways));
+    }
+
+    Entry* find(uint32_t key) {
+        uint32_t index = key & (num_sets - 1);
+        for (auto &e : entries[index]) {
+            if (e.data.valid && e.key == key)
+                return &e;
+        }
+        return nullptr;
+    }
+
+    void insert(uint32_t key, int16_t stride) {
+        uint32_t index = key & (num_sets - 1);
+        for (auto &e : entries[index]) {
+            if (!e.data.valid) {
+                e = {key, {stride, 1, 1, true, 0, 0}};
+                return;
+            }
+        }
+
+       auto &victim = *std::min_element(entries[index].begin(), entries[index].end(),
+            [](const Entry &a, const Entry &b) {
+                return a.data.frequency < b.data.frequency;
+            });
+        victim = {key, {stride, 1, 1, true, 0, 0}};
+    }
+
+private:
+    int num_sets, num_ways;
+    std::vector<std::vector<Entry>> entries;
+};
+
+StrideTable* stride_table;
+CappedMap<uint32_t, StrideTableData, 32> const_stride_table(
+    [](const StrideTableData &d)->uint8_t { return d.confidence; }
+);
+
+// =============== Prefetch Tracker ==================
+CappedMap<uint32_t, uint8_t, 32> prefetched_map; // value: 0 = issued but not yet used, 1 = used
+
+// =============== Dupe Table with FIFO replacement ====================
+FifoCappedMap<uint32_t, uint8_t, 64> dupe_table; // FIFO-based duplicate filter
+
+static uint64_t block_mask = 0x3F;
+static const int PREFETCHS_PER_ACCESS_BUDGET = 3;
+static const int PREFETCHS_PER_ACCESS_BUDGET_CAP = 8; // safety cap
+static const uint8_t CS_CONFIDENCE_THRESH = 3;
+
+// Helper to mark a prefetched block as issued
+static inline void mark_prefetch_issued(uint64_t hash_addr) {
+    uint8_t v = 0;
+    prefetched_map.put(hash_addr, v);
+    dupe_table.put(hash_addr, 1); // also remember in dupe table
+}
+
+// Helper to mark a prefetched block as used by demand
+static inline bool mark_prefetch_used(uint64_t hash_addr) {
+    uint8_t *p = prefetched_map.get_ptr(hash_addr);
+    if (!p) return false;
+    if (*p == 1) return false;
+    *p = 1;
+    return true;
+}
+
+static inline bool already_prefetched(uint64_t hash_addr) {
+    return dupe_table.contains(hash_addr);
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type) {
+    uint64_t block_addr = addr & ~block_mask;
+    uint32_t hash_addr = hash_pc_addr(0, block_addr);
+    int16_t delta_16 = 0;
+    uint32_t hashed_ip_key = hash_pc_addr(ip, 0); //Change it to hash_ip
+
+    if (cache_hit) {
+        if (mark_prefetch_used(block_addr)) {
+            //pf_useful++; //Remove
+            StrideTableData* cs_ptr_temp = const_stride_table.get_ptr(hashed_ip_key);
+            if (cs_ptr_temp) {
+                if (cs_ptr_temp->useful_count < std::numeric_limits<uint16_t>::max()) cs_ptr_temp->useful_count++;
+                const_stride_table.put(hashed_ip_key, *cs_ptr_temp);
+            }
+            uint32_t key = static_cast<uint32_t>(hash_pc_addr(ip, block_addr >> 6)); //put all has together
+            Entry* ds_e = stride_table->find(key);
+            if (ds_e) {
+                if (ds_e->data.useful_count < std::numeric_limits<uint16_t>::max()) ds_e->data.useful_count++;
+            }
+        }
+    }
+
+    int base_budget = PREFETCHS_PER_ACCESS_BUDGET;
+    int pf_budget = cache_hit ? base_budget : clamp_t(base_budget * 2, 0, PREFETCHS_PER_ACCESS_BUDGET_CAP);
+
+    std::unordered_set<uint64_t> issued_pf_addresses;
+
+    StrideTableData cs_entry;
+    StrideTableData* cs_ptr = const_stride_table.get_ptr(hashed_ip_key);
+    bool cs_exists = (cs_ptr != nullptr);
+    if (cs_exists) cs_entry = *cs_ptr;
+
+    uint32_t key = static_cast<uint32_t>(hash_pc_addr(ip, block_addr >> 6));
+    Entry* ds_entry = stride_table->find(key);
+    int16_t baseline_stride = ds_entry ? ds_entry->data.stride : 64;
+
+
+    // ===== Constant Stride Prefetch Path =====
+    if (cs_exists) {
+        if (cache_hit) {
+            cs_entry.useful_count++;	//Double useful_count increment
+            if (cs_entry.confidence < 3 && cs_entry.useful_count > cs_entry.useless_count)
+                cs_entry.confidence++;
+        } else {
+            cs_entry.useless_count++;
+            if (cs_entry.confidence > 0 && cs_entry.useless_count > cs_entry.useful_count)
+                cs_entry.confidence--;
+        }
+
+        if (cs_entry.confidence >= CS_CONFIDENCE_THRESH) {
+            for (int i = 1; i <= pf_budget; ++i) {
+                uint64_t pf_addr = block_addr + (int64_t)cs_entry.stride * i;
+                if (pf_addr == block_addr) continue;
+                if (already_prefetched(pf_addr)) continue;
+                if (issued_pf_addresses.insert(pf_addr).second) {
+                    mark_prefetch_issued(pf_addr);
+                    prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+                }
+            }
+            pf_budget = 0;
+            const_stride_table.put(hashed_ip_key, cs_entry);
+            if (ds_entry) {
+                if (ds_entry->data.frequency < 63) ds_entry->data.frequency++;
+                ds_entry->data.confidence = std::min<uint8_t>(ds_entry->data.confidence + 1, 3);
+            }
+            return;
+        } else {
+            const_stride_table.put(hashed_ip_key, cs_entry);
+        }
+    }
+
+    // ===== Dynamic Stride Path =====
+    if (ds_entry) {
+        for (int i = 1; i <= pf_budget; ++i) {
+            uint64_t pf_addr = block_addr + (int64_t)ds_entry->data.stride * i;
+            if (pf_addr == block_addr) continue;
+            if (already_prefetched(pf_addr)) continue;
+            if (issued_pf_addresses.insert(pf_addr).second) {
+                mark_prefetch_issued(pf_addr);
+                prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+            }
+        }
+        if (cache_hit) {
+            if (ds_entry->data.frequency < 63) ds_entry->data.frequency++;
+            ds_entry->data.confidence = std::min<uint8_t>(ds_entry->data.confidence + 1, 3);
+        } else {
+            if (ds_entry->data.frequency > 0) ds_entry->data.frequency--;
+            if (ds_entry->data.confidence > 0) ds_entry->data.confidence--;
+        }
+    } else {
+        stride_table->insert(key, baseline_stride);
+        uint64_t pf_addr_next = block_addr + baseline_stride;
+        if (pf_addr_next != block_addr && !already_prefetched(pf_addr_next) &&
+            issued_pf_addresses.insert(pf_addr_next).second && pf_budget > 0) {
+            mark_prefetch_issued(pf_addr_next);
+            prefetch_line(ip, addr, pf_addr_next, FILL_L1, 0);
+            pf_budget--;
+        }
+        if (!cache_hit && pf_budget > 0) {
+            uint64_t pf_addr_next2 = block_addr + baseline_stride * 2;
+            if (pf_addr_next2 != block_addr && !already_prefetched(pf_addr_next2) &&
+                issued_pf_addresses.insert(pf_addr_next2).second) {
+                mark_prefetch_issued(pf_addr_next2);
+                prefetch_line(ip, addr, pf_addr_next2, FILL_L1, 0);
+                pf_budget--;
+            }
+        }
+    }
+    // Fallback sequential
+    if (pf_budget > 0) {
+        for (int i = 1; i <= pf_budget; ++i) {
+            uint64_t pf_addr = block_addr + (int64_t)baseline_stride * i;
+            if (pf_addr == block_addr) continue;
+            if (already_prefetched(pf_addr)) continue;
+            if (issued_pf_addresses.insert(pf_addr).second) {
+                mark_prefetch_issued(pf_addr);
+                prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+            }
+        }
+    }
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t, uint32_t, uint32_t, uint8_t, uint64_t, uint32_t) {}
+
+void CACHE::l1d_prefetcher_final_stats() {
+    std::cout << "L1D Prefetcher Useful Prefetch Count: " << pf_useful << std::endl;
+    std::cout << "L1D Prefetcher Useless Prefetch Count: " << pf_useless << std::endl;
+    double accuracy = (pf_useful + pf_useless) > 0 ?
+        (double)pf_useful / (pf_useful + pf_useless) : 0.0;
+    std::cout << "Prefetch Accuracy: " << accuracy * 100 << "%" << std::endl;
+}
+
+void CACHE::l1d_prefetcher_initialize() {
+    stride_table = new StrideTable(16, 2);
+}
+
